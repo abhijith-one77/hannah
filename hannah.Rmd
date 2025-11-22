@@ -1,0 +1,752 @@
+```{r}
+############################################################
+## Build a gene x sample count matrix from your 18 files
+## /opt/app-root/src/home/hannah
+############################################################
+
+# 1. Load packages
+library(readr)
+library(dplyr)
+library(purrr)
+
+# 2. Directory where your files live
+data_dir <- "/opt/app-root/src/home/hannah"   # change if needed
+
+# 3. List all .txt.gz files in that directory
+files <- list.files(
+  path   = data_dir,
+  pattern = "\\.txt\\.gz$",
+  full.names = TRUE
+)
+
+cat("Number of .txt.gz files found:", length(files), "\n")
+cat("Example file names:\n")
+print(basename(files))
+
+# 4. Function to read ONE file and split "ENSG... count"
+parse_counts_file <- function(f) {
+  # read as one-column table (character)
+  tbl <- read_tsv(f, col_names = FALSE, show_col_types = FALSE)
+  x <- tbl[[1]]  # the only column
+  
+  # split into gene_id (before first space) and count (after last space)
+  gene_id <- sub(" .*", "", x)
+  count   <- as.numeric(sub(".* ", "", x))
+  
+  tibble(gene_id = gene_id, count = count)
+}
+
+# 5. Read and parse ALL files
+parsed_list <- lapply(files, parse_counts_file)
+names(parsed_list) <- sub("\\.txt\\.gz$", "", basename(files))
+
+# Quick check of one example
+cat("\nExample parsed table:\n")
+print(head(parsed_list[[1]], 10))
+
+# 6. Create a vector of ALL unique gene IDs across all files
+all_genes <- sort(unique(unlist(lapply(parsed_list, function(df) df$gene_id))))
+cat("\nTotal unique genes:", length(all_genes), "\n")
+
+# 7. Build an empty matrix: rows = genes, cols = samples
+count_mat <- matrix(
+  0,
+  nrow = length(all_genes),
+  ncol = length(parsed_list),
+  dimnames = list(all_genes, names(parsed_list))
+)
+
+# 8. Fill the matrix with counts for each sample
+for (i in seq_along(parsed_list)) {
+  df  <- parsed_list[[i]]
+  idx <- match(df$gene_id, all_genes)
+  count_mat[idx, i] <- df$count
+}
+
+# 9. Convert to data.frame for easier handling
+count_df <- as.data.frame(count_mat)
+
+############################################################
+## From count_df -> DESeq2 (Illumina, H1975 vs HCC827)
+############################################################
+
+# Quick check:
+dim(count_df)    # should be ~78206 x 18
+
+## 2. Keep only real genes: rows whose names start with "ENSG"
+gene_ids <- rownames(count_df)
+is_gene  <- grepl("^ENSG", gene_ids)
+
+count_genes <- count_df[is_gene, ]
+dim(count_genes)   # fewer rows now, only ENSG* genes
+
+## 3. Build sample metadata (colData) from column names
+sample_ids <- colnames(count_genes)
+
+cell_line <- ifelse(grepl("H1975",  sample_ids), "H1975",
+                    ifelse(grepl("HCC827", sample_ids), "HCC827", NA))
+
+platform  <- ifelse(grepl("Illumina", sample_ids), "Illumina",
+              ifelse(grepl("ONT",      sample_ids), "ONT",
+              ifelse(grepl("PacBio",   sample_ids), "PacBio", NA)))
+
+coldata <- data.frame(
+  sample_id = sample_ids,
+  cell_line = factor(cell_line),
+  platform  = factor(platform),
+  row.names = sample_ids
+)
+
+coldata
+```
+
+
+```{r}
+## 4. Subset to Illumina samples only
+keep_illumina <- coldata$platform == "Illumina"
+
+counts_illumina   <- as.matrix(count_genes[, keep_illumina])
+coldata_illumina  <- coldata[keep_illumina, ]
+
+dim(counts_illumina)       # genes x Illumina samples (should be genes x 6)
+coldata_illumina
+
+## 5. Load DESeq2 (install if needed)
+if (!requireNamespace("DESeq2", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+  }
+  BiocManager::install("DESeq2")
+}
+
+library(DESeq2)
+
+## 6. Create DESeq2 dataset (design = cell_line)
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_illumina,
+  colData   = coldata_illumina,
+  design    = ~ cell_line
+)
+
+## 7. Run DESeq2
+dds <- DESeq(dds)
+
+## 8. Get results: H1975 vs HCC827
+res <- results(dds, contrast = c("cell_line", "H1975", "HCC827"))
+
+## 9. Order by adjusted p-value and show top genes
+res_ordered <- res[order(res$padj), ]
+
+head(res_ordered)
+
+## 10. Optionally, write results to file
+write.csv(
+  as.data.frame(res_ordered),
+  file = "DESeq2_Illumina_H1975_vs_HCC827.csv"
+)
+
+cat("\nDESeq2 analysis finished. Results saved to:\n")
+cat("DESeq2_Illumina_H1975_vs_HCC827.csv\n")
+############################################################
+
+
+```
+
+```{r}
+############################################################
+## DESeq2 for ONT samples (H1975 vs HCC827)
+############################################################
+
+# 1. We assume you already have:
+#    - count_genes   (genes x samples, only ENSG rows)
+#    - coldata       (sample metadata: cell_line + platform)
+
+# Quick check: uncomment if needed
+# dim(count_genes)
+# head(coldata)
+
+# 2. Subset to ONT samples only
+keep_ont <- coldata$platform == "ONT"
+
+counts_ont <- as.matrix(count_genes[, keep_ont])
+coldata_ont <- coldata[keep_ont, ]
+
+cat("ONT samples found:\n")
+print(coldata_ont)
+
+cat("\nDimensions of ONT count matrix:\n")
+print(dim(counts_ont))     # should be genes x 6 ONT samples
+
+# 3. Load DESeq2 (install if needed)
+if (!requireNamespace("DESeq2", quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+    }
+    BiocManager::install("DESeq2")
+}
+
+library(DESeq2)
+
+# 4. Create DESeq2 dataset
+dds_ont <- DESeqDataSetFromMatrix(
+    countData = counts_ont,
+    colData   = coldata_ont,
+    design    = ~ cell_line
+)
+
+# 5. Run DESeq2
+dds_ont <- DESeq(dds_ont)
+
+# 6. Get results (H1975 vs HCC827)
+res_ont <- results(dds_ont, contrast = c("cell_line", "H1975", "HCC827"))
+
+# 7. Order by padj
+res_ont_ordered <- res_ont[order(res_ont$padj), ]
+
+# Show top genes
+cat("\nTop ONT DE genes:\n")
+print(head(res_ont_ordered))
+
+# 8. Save results
+write.csv(
+    as.data.frame(res_ont_ordered),
+    file = "DESeq2_ONT_H1975_vs_HCC827.csv"
+)
+
+cat("\nDESeq2 ONT analysis finished. Results saved to:\n")
+cat("DESeq2_ONT_H1975_vs_HCC827.csv\n")
+############################################################
+
+```
+
+```{r}
+############################################################
+## DESeq2 for PacBio samples (H1975 vs HCC827)
+############################################################
+
+# 1. We assume you already have:
+#    - count_genes   (genes x samples, only ENSG rows)
+#    - coldata       (sample metadata: cell_line + platform)
+
+# Quick check (optional)
+# dim(count_genes)
+# head(coldata)
+
+# 2. Subset to PacBio samples only
+keep_pacbio <- coldata$platform == "PacBio"
+
+counts_pacbio  <- as.matrix(count_genes[, keep_pacbio])
+coldata_pacbio <- coldata[keep_pacbio, ]
+
+cat("PacBio samples found:\n")
+print(coldata_pacbio)
+
+cat("\nDimensions of PacBio count matrix (genes x samples):\n")
+print(dim(counts_pacbio))     # should be genes x 6 PacBio samples
+
+# 3. Load DESeq2 (install if needed)
+if (!requireNamespace("DESeq2", quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager")
+    }
+    BiocManager::install("DESeq2")
+}
+library(DESeq2)
+
+# 4. Create DESeq2 dataset
+dds_pacbio <- DESeqDataSetFromMatrix(
+    countData = counts_pacbio,
+    colData   = coldata_pacbio,
+    design    = ~ cell_line
+)
+
+# 5. Run DESeq2
+dds_pacbio <- DESeq(dds_pacbio)
+
+# 6. Get results (H1975 vs HCC827)
+res_pacbio <- results(dds_pacbio, contrast = c("cell_line", "H1975", "HCC827"))
+
+# 7. Order by adjusted p-value
+res_pacbio_ordered <- res_pacbio[order(res_pacbio$padj), ]
+
+# Show top genes in console
+cat("\nTop PacBio DE genes:\n")
+print(head(res_pacbio_ordered))
+
+# 8. Save results to CSV
+write.csv(
+    as.data.frame(res_pacbio_ordered),
+    file = "DESeq2_PacBio_H1975_vs_HCC827.csv"
+)
+
+cat("\nDESeq2 PacBio analysis finished. Results saved to:\n")
+cat("DESeq2_PacBio_H1975_vs_HCC827.csv\n")
+############################################################
+
+```
+
+```{r}
+############################################################
+## STEP 1: Compare Illumina, ONT, PacBio DESeq2 results
+############################################################
+
+# 1. Load the DESeq2 results for each platform
+ill <- read.csv("DESeq2_Illumina_H1975_vs_HCC827.csv", row.names = 1)
+ont <- read.csv("DESeq2_ONT_H1975_vs_HCC827.csv", row.names = 1)
+pb  <- read.csv("DESeq2_PacBio_H1975_vs_HCC827.csv", row.names = 1)
+
+# Quick check
+dim(ill); dim(ont); dim(pb)
+head(ill[, c("log2FoldChange", "padj")])
+
+# 2. Keep just log2FC and padj for each
+ill_sub <- ill[, c("log2FoldChange", "padj")]
+ont_sub <- ont[, c("log2FoldChange", "padj")]
+pb_sub  <- pb[,  c("log2FoldChange", "padj")]
+
+colnames(ill_sub) <- c("log2FC_Illumina", "padj_Illumina")
+colnames(ont_sub) <- c("log2FC_ONT",      "padj_ONT")
+colnames(pb_sub)  <- c("log2FC_PacBio",   "padj_PacBio")
+
+# 3. Merge by gene (rownames = gene IDs)
+# Use merge(..., all = TRUE) to keep all genes
+merged12 <- merge(ill_sub, ont_sub, by = "row.names", all = TRUE)
+rownames(merged12) <- merged12$Row.names
+merged12$Row.names <- NULL
+
+merged_all <- merge(merged12, pb_sub, by = "row.names", all = TRUE)
+rownames(merged_all) <- merged_all$Row.names
+merged_all$Row.names <- NULL
+
+dim(merged_all)
+head(merged_all)
+
+# 4. Correlation of log2 fold changes (only where both are not NA)
+
+# Illumina vs ONT
+idx_io <- complete.cases(merged_all$log2FC_Illumina, merged_all$log2FC_ONT)
+cor_IO <- cor(
+  merged_all$log2FC_Illumina[idx_io],
+  merged_all$log2FC_ONT[idx_io]
+)
+cor_IO
+
+# Illumina vs PacBio
+idx_ip <- complete.cases(merged_all$log2FC_Illumina, merged_all$log2FC_PacBio)
+cor_IP <- cor(
+  merged_all$log2FC_Illumina[idx_ip],
+  merged_all$log2FC_PacBio[idx_ip]
+)
+cor_IP
+
+# ONT vs PacBio
+idx_op <- complete.cases(merged_all$log2FC_ONT, merged_all$log2FC_PacBio)
+cor_OP <- cor(
+  merged_all$log2FC_ONT[idx_op],
+  merged_all$log2FC_PacBio[idx_op]
+)
+cor_OP
+
+cat("\nCorrelation of log2FC:\n")
+cat("Illumina vs ONT:    ", cor_IO, "\n")
+cat("Illumina vs PacBio: ", cor_IP, "\n")
+cat("ONT vs PacBio:      ", cor_OP, "\n")
+
+# 5. Overlap of significantly DE genes (padj < 0.05 and |log2FC| >= 1)
+
+sig_ill <- rownames(ill_sub)[which(ill_sub$padj_Illumina < 0.05 &
+                                   abs(ill_sub$log2FC_Illumina) >= 1)]
+sig_ont <- rownames(ont_sub)[which(ont_sub$padj_ONT < 0.05 &
+                                   abs(ont_sub$log2FC_ONT) >= 1)]
+sig_pb  <- rownames(pb_sub)[which(pb_sub$padj_PacBio < 0.05 &
+                                  abs(pb_sub$log2FC_PacBio) >= 1)]
+
+length(sig_ill); length(sig_ont); length(sig_pb)
+
+# pairwise overlaps
+overlap_ill_ont <- intersect(sig_ill, sig_ont)
+overlap_ill_pb  <- intersect(sig_ill, sig_pb)
+overlap_ont_pb  <- intersect(sig_ont, sig_pb)
+
+# triple overlap
+overlap_all3 <- Reduce(intersect, list(sig_ill, sig_ont, sig_pb))
+
+cat("\nSignificant DE genes (padj < 0.05 & |log2FC| >= 1):\n")
+cat("Illumina: ", length(sig_ill), "\n")
+cat("ONT:      ", length(sig_ont), "\n")
+cat("PacBio:   ", length(sig_pb),  "\n\n")
+
+cat("Overlap Illumina ∩ ONT:    ", length(overlap_ill_ont), "\n")
+cat("Overlap Illumina ∩ PacBio: ", length(overlap_ill_pb),  "\n")
+cat("Overlap ONT ∩ PacBio:      ", length(overlap_ont_pb),  "\n")
+cat("Overlap all three:         ", length(overlap_all3),    "\n")
+dim(count_df)
+
+```
+
+
+```{r}
+############################################################
+## STEP 2: Combined DESeq2 + PCA + Sample Clustering
+############################################################
+
+# 0. If needed:
+# library(DESeq2)
+# install.packages("pheatmap")   # if not installed
+
+library(DESeq2)
+library(pheatmap)
+
+# 1. Filter to real genes (ENSG rows) if not already done
+gene_ids <- rownames(count_df)
+is_gene  <- grepl("^ENSG", gene_ids)
+
+count_genes <- count_df[is_gene, ]
+dim(count_genes)   # genes x 18 samples
+
+# 2. Build sample metadata (colData) from column names
+sample_ids <- colnames(count_genes)
+
+cell_line <- ifelse(grepl("H1975",  sample_ids), "H1975",
+             ifelse(grepl("HCC827", sample_ids), "HCC827", NA))
+
+platform  <- ifelse(grepl("Illumina", sample_ids), "Illumina",
+             ifelse(grepl("ONT",      sample_ids), "ONT",
+             ifelse(grepl("PacBio",   sample_ids), "PacBio", NA)))
+
+coldata_all <- data.frame(
+  sample_id = sample_ids,
+  cell_line = factor(cell_line),
+  platform  = factor(platform),
+  row.names = sample_ids
+)
+
+coldata_all
+
+# Quick sanity check
+table(coldata_all$cell_line, coldata_all$platform)
+
+# 3. Create a DESeq2 object for ALL platforms together
+dds_all <- DESeqDataSetFromMatrix(
+  countData = as.matrix(count_genes),
+  colData   = coldata_all,
+  design    = ~ platform + cell_line
+)
+
+# Optional: filter out very lowly expressed genes
+keep <- rowSums(counts(dds_all)) >= 10
+dds_all <- dds_all[keep, ]
+dds_all
+
+# 4. Run DESeq2 (fits model; you can use results later if you want)
+dds_all <- DESeq(dds_all)
+
+# 5. Variance stabilizing transform for PCA & clustering
+vsd_all <- vst(dds_all, blind = TRUE)
+
+# 6. PCA plot (colour by platform, shape by cell line)
+pca_data <- plotPCA(vsd_all, intgroup = c("platform", "cell_line"), returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+library(ggplot2)
+
+ggplot(pca_data, aes(PC1, PC2, color = platform, shape = cell_line)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("PCA of H1975 vs HCC827 across platforms") +
+  theme_bw()
+
+# 7. Sample-to-sample distance heatmap
+sampleDists <- dist(t(assay(vsd_all)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- colnames(vsd_all)
+colnames(sampleDistMatrix) <- colnames(vsd_all)
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         main = "Sample-to-sample distance (vst counts)")
+############################################################
+
+```
+
+```{r}
+############################################################
+## STEP 3: Volcano + MA plots for Illumina, ONT, PacBio
+############################################################
+
+library(ggplot2)
+
+# Load DESeq2 results
+ill <- read.csv("DESeq2_Illumina_H1975_vs_HCC827.csv", row.names = 1)
+ont <- read.csv("DESeq2_ONT_H1975_vs_HCC827.csv", row.names = 1)
+pb  <- read.csv("DESeq2_PacBio_H1975_vs_HCC827.csv", row.names = 1)
+
+# Function to make volcano plot
+make_volcano <- function(df, title) {
+  df$neglog10padj <- -log10(df$padj)
+  df$significant <- ifelse(df$padj < 0.05 & abs(df$log2FoldChange) >= 1, "DE", "NotDE")
+
+  ggplot(df, aes(x = log2FoldChange, y = neglog10padj, color = significant)) +
+    geom_point(alpha = 0.4) +
+    scale_color_manual(values = c("gray", "red")) +
+    theme_bw() +
+    ggtitle(paste("Volcano Plot -", title)) +
+    xlab("log2 Fold Change") +
+    ylab("-log10(adj p-value)")
+}
+
+# Function to make MA plot
+make_ma <- function(df, title) {
+  df$significant <- ifelse(df$padj < 0.05 & abs(df$log2FoldChange) >= 1, "DE", "NotDE")
+
+  ggplot(df, aes(x = baseMean, y = log2FoldChange, color = significant)) +
+    geom_point(alpha = 0.4) +
+    scale_x_log10() +
+    scale_color_manual(values = c("gray", "blue")) +
+    theme_bw() +
+    ggtitle(paste("MA Plot -", title)) +
+    xlab("Mean Expression (baseMean)") +
+    ylab("log2 Fold Change")
+}
+
+### Volcano plots
+make_volcano(ill, "Illumina")
+make_volcano(ont, "ONT (Oxford Nanopore)")
+make_volcano(pb,  "PacBio")
+
+### MA plots
+make_ma(ill, "Illumina")
+make_ma(ont, "ONT (Oxford Nanopore)")
+make_ma(pb,  "PacBio")
+############################################################
+
+```
+
+```{r}
+############################################################
+## STEP 4A: Venn diagram of DE genes across platforms
+############################################################
+
+# install.packages("VennDiagram")  # run once if needed
+library(VennDiagram)
+
+# Reload results (or reuse if already in memory)
+ill <- read.csv("DESeq2_Illumina_H1975_vs_HCC827.csv", row.names = 1)
+ont <- read.csv("DESeq2_ONT_H1975_vs_HCC827.csv", row.names = 1)
+pb  <- read.csv("DESeq2_PacBio_H1975_vs_HCC827.csv", row.names = 1)
+
+# Extract DE gene sets
+sig_ill <- rownames(ill)[which(ill$padj < 0.05 & abs(ill$log2FoldChange) >= 1)]
+sig_ont <- rownames(ont)[which(ont$padj < 0.05 & abs(ont$log2FoldChange) >= 1)]
+sig_pb  <- rownames(pb)[which(pb$padj  < 0.05 & abs(pb$log2FoldChange)  >= 1)]
+
+length(sig_ill); length(sig_ont); length(sig_pb)
+
+venn.plot <- venn.diagram(
+  x = list(
+    Illumina = sig_ill,
+    ONT      = sig_ont,
+    PacBio   = sig_pb
+  ),
+  filename = NULL,  # draw to R graphics device
+  fill = c("red", "green", "blue"),
+  alpha = 0.4,
+  cex = 1.2,
+  cat.cex = 1.2,
+  main = "DE genes overlap (padj < 0.05 & |log2FC| >= 1)"
+)
+
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+############################################################
+
+```
+
+```{r}
+# assumes sig_ill, sig_ont, sig_pb are already defined
+
+library(ggplot2)
+
+ill_only <- setdiff(sig_ill, union(sig_ont, sig_pb))
+ont_only <- setdiff(sig_ont, union(sig_ill, sig_pb))
+pb_only  <- setdiff(sig_pb,  union(sig_ill, sig_ont))
+
+ill_ont_only <- setdiff(intersect(sig_ill, sig_ont), sig_pb)
+ill_pb_only  <- setdiff(intersect(sig_ill, sig_pb),  sig_ont)
+ont_pb_only  <- setdiff(intersect(sig_ont, sig_pb),  sig_ill)
+
+all_three <- Reduce(intersect, list(sig_ill, sig_ont, sig_pb))
+
+overlap_df <- data.frame(
+  group = c("Illumina only",
+            "ONT only",
+            "PacBio only",
+            "Illumina + ONT",
+            "Illumina + PacBio",
+            "ONT + PacBio",
+            "All three"),
+  n = c(length(ill_only),
+        length(ont_only),
+        length(pb_only),
+        length(ill_ont_only),
+        length(ill_pb_only),
+        length(ont_pb_only),
+        length(all_three))
+)
+
+ggplot(overlap_df, aes(x = group, y = n)) +
+  geom_col() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylab("Number of DE genes") +
+  xlab("") +
+  ggtitle("Overlap of DE genes across platforms")
+
+```
+
+```{r}
+############################################################
+## STEP 5: GO & KEGG Enrichment for the 47 shared DE genes
+############################################################
+
+# Load results
+ill <- read.csv("DESeq2_Illumina_H1975_vs_HCC827.csv", row.names = 1)
+ont <- read.csv("DESeq2_ONT_H1975_vs_HCC827.csv", row.names = 1)
+pb  <- read.csv("DESeq2_PacBio_H1975_vs_HCC827.csv", row.names = 1)
+
+# Define DE genes
+sig_ill <- rownames(ill)[which(ill$padj < 0.05 & abs(ill$log2FoldChange) >= 1)]
+sig_ont <- rownames(ont)[which(ont$padj < 0.05 & abs(ont$log2FoldChange) >= 1)]
+sig_pb  <- rownames(pb)[which(pb$padj  < 0.05 & abs(pb$log2FoldChange)  >= 1)]
+
+# The 47 genes shared by all platforms
+shared47 <- Reduce(intersect, list(sig_ill, sig_ont, sig_pb))
+length(shared47)
+shared47[1:10]
+############################################################
+
+```
+
+```{r}
+############################################################
+## GO + KEGG enrichment for DE genes shared by all platforms
+## (Illumina, ONT, PacBio: H1975 vs HCC827)
+############################################################
+
+# Load required packages
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+############################################################
+## 1. Load DESeq2 results
+############################################################
+
+ill <- read.csv("DESeq2_Illumina_H1975_vs_HCC827.csv", row.names = 1)
+ont <- read.csv("DESeq2_ONT_H1975_vs_HCC827.csv", row.names = 1)
+pb  <- read.csv("DESeq2_PacBio_H1975_vs_HCC827.csv", row.names = 1)
+
+############################################################
+## 2. Define DE gene sets per platform
+##    Criteria: padj < 0.05 and |log2FC| >= 1
+############################################################
+
+sig_ill <- rownames(ill)[which(ill$padj < 0.05 & abs(ill$log2FoldChange) >= 1)]
+sig_ont <- rownames(ont)[which(ont$padj < 0.05 & abs(ont$log2FoldChange) >= 1)]
+sig_pb  <- rownames(pb)[which(pb$padj  < 0.05 & abs(pb$log2FoldChange)  >= 1)]
+
+cat("DE genes per platform (padj < 0.05, |log2FC| >= 1):\n")
+cat("Illumina:", length(sig_ill), "\n")
+cat("ONT:     ", length(sig_ont), "\n")
+cat("PacBio:  ", length(sig_pb),  "\n\n")
+
+############################################################
+## 3. Find genes shared by ALL THREE platforms
+############################################################
+
+shared_genes <- Reduce(intersect, list(sig_ill, sig_ont, sig_pb))
+cat("Genes shared by all three platforms:", length(shared_genes), "\n\n")
+
+# Look at first few
+head(shared_genes)
+
+############################################################
+## 4. Strip Ensembl version suffix (e.g. .16)
+##    ENSG00000100033.16 -> ENSG00000100033
+############################################################
+
+shared_novers <- sub("\\.\\d+$", "", shared_genes)
+
+head(shared_genes)
+head(shared_novers)
+
+############################################################
+## 5. Map Ensembl IDs -> Entrez IDs
+############################################################
+
+entrez_shared <- mapIds(
+  org.Hs.eg.db,
+  keys      = shared_novers,
+  keytype   = "ENSEMBL",
+  column    = "ENTREZID",
+  multiVals = "first"
+)
+
+# Drop genes that failed to map
+entrez_shared <- na.omit(entrez_shared)
+cat("Mapped to Entrez IDs:", length(entrez_shared), "genes\n\n")
+entrez_shared[1:10]
+
+############################################################
+## 6. GO Biological Process (BP) enrichment
+############################################################
+
+ego <- enrichGO(
+  gene          = entrez_shared,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+cat("Top GO BP terms:\n")
+print(head(ego, 5))
+
+# Barplot of top 15 GO BP terms
+barplot(ego,
+        showCategory = 15,
+        title = "GO Biological Process enrichment\n(shared DE genes across Illumina, ONT, PacBio)")
+
+############################################################
+## 7. KEGG pathway enrichment
+############################################################
+
+ekegg <- enrichKEGG(
+  gene         = entrez_shared,
+  organism     = "hsa",
+  pvalueCutoff = 0.05
+)
+
+cat("\nTop KEGG pathways:\n")
+print(head(ekegg, 5))
+
+# Barplot of top 10 KEGG pathways (if any)
+if (nrow(as.data.frame(ekegg)) > 0) {
+  barplot(ekegg,
+          showCategory = 10,
+          title = "KEGG pathway enrichment\n(shared DE genes across Illumina, ONT, PacBio)")
+} else {
+  cat("\nNo significant KEGG pathways at pvalueCutoff = 0.05\n")
+}
+
+############################################################
+## END
+############################################################
+
+
+```
+
